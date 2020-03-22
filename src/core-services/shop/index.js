@@ -5,6 +5,7 @@ import resolvers from "./resolvers/index.js";
 import schemas from "./schemas/index.js";
 import createDataLoaders from "./utils/createDataLoaders.js";
 import { Shop } from "./simpleSchemas.js";
+import { jsonSchema } from "./jsonSchema.js";
 
 /**
  * @summary Import and call this function to add this plugin to your API.
@@ -25,7 +26,8 @@ export default async function register(app) {
           [{ domains: 1 }, { name: "c2_domains" }],
           [{ name: 1 }, { name: "c2_name" }],
           [{ slug: 1 }, { name: "c2_slug", sparse: true, unique: true }]
-        ]
+        ],
+        schema: jsonSchema
       }
     },
     graphQL: {
