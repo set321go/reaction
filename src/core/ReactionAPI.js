@@ -3,18 +3,15 @@ import { createRequire } from "module";
 import diehard from "diehard";
 import express from "express";
 import _ from "lodash";
-import mongodb from "mongodb";
 import SimpleSchema from "simpl-schema";
-import collectionIndex from "@reactioncommerce/api-utils/collectionIndex.js";
 import importAsString from "@reactioncommerce/api-utils/importAsString.js";
 import Logger from "@reactioncommerce/logger";
 import appEvents from "./util/appEvents.js";
 import getAbsoluteUrl from "./util/getAbsoluteUrl.js";
-import initReplicaSet from "./util/initReplicaSet.js";
-import mongoConnectWithRetry from "./util/mongoConnectWithRetry.js";
 import config from "./config.js";
 import createApolloServer from "./createApolloServer.js";
 import coreResolvers from "./graphql/resolvers/index.js";
+import MongoRepository from "./repository/MongoRepository.js"
 
 const require = createRequire(import.meta.url); // eslint-disable-line
 const { PubSub } = require("apollo-server");
@@ -25,10 +22,8 @@ const coreGraphQLSubscriptionSchema = importAsString("./graphql/subscription.gra
 const {
   REACTION_APOLLO_FEDERATION_ENABLED,
   REACTION_GRAPHQL_SUBSCRIPTIONS_ENABLED,
-  MONGO_URL,
   PORT,
   REACTION_LOG_LEVEL,
-  REACTION_SHOULD_INIT_REPLICA_SET,
   ROOT_URL
 } = config;
 
@@ -55,13 +50,6 @@ const optionsSchema = new SimpleSchema({
     optional: true
   },
   "version": {
-    type: String,
-    optional: true
-  }
-});
-
-const connectOptionsSchema = new SimpleSchema({
-  mongoUrl: {
     type: String,
     optional: true
   }
@@ -158,7 +146,7 @@ export default class ReactionAPI {
     this.registeredPlugins = {};
     this.expressMiddleware = [];
 
-    this.mongodb = options.mongodb || mongodb;
+    this.repository = new MongoRepository(options);
   }
 
   _registerFunctionsByType(functionsByType, pluginName) {
@@ -178,85 +166,6 @@ export default class ReactionAPI {
           this.functionsByType[type].push({ func, pluginName });
         });
       });
-    }
-  }
-
-  /**
-   * @summary Use this method to provide the MongoDB database instance.
-   *   A side effect is that `this.collections`/`this.context.collections`
-   *   will have all collections available on it after this is called.
-   * @param {Database} db MongoDB library database instance
-   * @returns {undefined}
-   */
-  async setMongoDatabase(db) {
-    this.db = db;
-
-    // Reset these
-    this.collections = {};
-    this.context.collections = this.collections;
-
-    // Loop through all registered plugins
-    for (const pluginName in this.registeredPlugins) {
-      if ({}.hasOwnProperty.call(this.registeredPlugins, pluginName)) {
-        const pluginConfig = this.registeredPlugins[pluginName];
-
-        // If a plugin config has `collections` key
-        if (pluginConfig.collections) {
-          // Loop through `collections` object keys
-          for (const collectionKey in pluginConfig.collections) {
-            if ({}.hasOwnProperty.call(pluginConfig.collections, collectionKey)) {
-              const collectionConfig = pluginConfig.collections[collectionKey];
-
-              // Validate that the `collections` key value is an object and has `name`
-              if (!collectionConfig || typeof collectionConfig.name !== "string" || collectionConfig.name.length === 0) {
-                throw new Error(`In registerPlugin, collection "${collectionKey}" needs a name property`);
-              }
-
-              // Validate that the `collections` key hasn't already been taken by another plugin
-              if (this.collections[collectionKey]) {
-                throw new Error(`Plugin ${pluginName} defines a collection with key "${collectionKey}" in registerPlugin,` +
-                  " but another plugin has already defined a collection with that key");
-              }
-
-              // Add the collection instance to `context.collections`
-              this.collections[collectionKey] = this.db.collection(collectionConfig.name);
-
-              // If the collection config has `indexes` key, define all requested indexes
-              if (Array.isArray(collectionConfig.indexes)) {
-                const indexingPromises = collectionConfig.indexes.map((indexArgs) => (
-                  collectionIndex(this.collections[collectionKey], ...indexArgs)
-                ));
-                await Promise.all(indexingPromises); // eslint-disable-line no-await-in-loop
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  /**
-   * @summary Given a MongoDB URL, creates a connection to it, sets `this.mongoClient`,
-   *   calls `this.setMongoDatabase` with the database instance, and then
-   *   resolves the Promise.
-   * @param {Object} options Options object
-   * @param {String} [options.mongoUrl] MongoDB connection URL. Default is MONGO_URL env.
-   * @returns {Promise<undefined>} Nothing
-   */
-  async connectToMongo(options = {}) {
-    connectOptionsSchema.validate(options);
-
-    const { mongoUrl = MONGO_URL } = options;
-
-    const client = await mongoConnectWithRetry(mongoUrl);
-
-    this.mongoClient = client;
-    await this.setMongoDatabase(client.db()); // Uses db name from the connection string
-  }
-
-  async disconnectFromMongo() {
-    if (this.mongoClient) {
-      await this.mongoClient.close();
     }
   }
 
@@ -450,11 +359,6 @@ export default class ReactionAPI {
   async start(options = {}) {
     startOptionsSchema.validate(options);
 
-    const {
-      mongoUrl = MONGO_URL,
-      shouldInitReplicaSet = REACTION_SHOULD_INIT_REPLICA_SET
-    } = options;
-
     // Allow passing `port: null` to skip listening. Otherwise default to PORT env.
     let { port } = options;
     if (port === undefined) port = PORT;
@@ -477,29 +381,31 @@ export default class ReactionAPI {
 
     listenForDeath();
 
-    if (shouldInitReplicaSet) {
-      try {
-        await initReplicaSet(mongoUrl);
-      } catch (error) {
-        Logger.warn(`Failed to initialize a MongoDB replica set. This may result in errors or some things not working. Error: ${error.message}`);
-      }
-    }
+    // (1) Connect to DB database
+    await this.repository.connectToRepository();
 
-    // (1) Connect to MongoDB database
-    await this.connectToMongo({ mongoUrl });
+    // (1a) Register the db instance
+    this.context.app.db = this.repository.db;
 
-    // (2) Init the server here. Some startup may need `app.expressApp`
+    // (2) Register plugin types
+    this.collections = await this.repository.registerTypes(this.registeredPlugins);
+
+    // (2a) Register the collections
+    this.context.collections = this.collections;
+
+
+    // (3) Init the server here. Some startup may need `app.expressApp`
     this.initServer();
 
-    // (3) Run service startup functions
+    // (4) Run service startup functions
     await this.runServiceStartup();
 
-    // (4) Start the Express GraphQL server
+    // (5) Start the Express GraphQL server
     await this.startServer({ port });
   }
 
   /**
-   * @summary Stops the entire app. Closes the MongoDB connection and
+   * @summary Stops the entire app. Closes the DB connection and
    *   stops the Express server listening.
    * @returns {Promise<undefined>} Nothing
    */
@@ -523,8 +429,8 @@ export default class ReactionAPI {
     // (3) Stop app events since the handlers will not have database access after this point
     appEvents.stop();
 
-    // (4) Disconnect from MongoDB database
-    await this.disconnectFromMongo();
+    // (4) Disconnect from DB database
+    await this.repository.disconnectFromRepository();
   }
 
   /**

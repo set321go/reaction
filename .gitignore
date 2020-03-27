@@ -68,3 +68,6 @@ client/plugins.less
 server/plugins.js
 
 docker-compose.override.yml
+
+.idea/
+*.iml

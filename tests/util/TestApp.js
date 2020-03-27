@@ -176,9 +176,9 @@ class TestApp {
     await this.reactionNodeApp.stop();
 
     // Delete the temporary database
-    await this.reactionNodeApp.connectToMongo({ mongoUrl: this.mongoUrl });
-    await this.reactionNodeApp.mongoClient.db().dropDatabase();
-    await this.reactionNodeApp.disconnectFromMongo();
+    await this.reactionNodeApp.repository.connectToRepository();
+    await this.reactionNodeApp.repository.db.dropDatabase();
+    await this.reactionNodeApp.repository.disconnectFromRepository();
   }
 }
 
